@@ -1,0 +1,225 @@
+# Our application: the Spring Boot API, from the image built with the Dockerfile in the project root.
+#
+#   docker build -t carmarketplace-api:dev .
+#   kubectl rollout restart deploy/api -n carmarketplace     # pick up a new image
+#   kubectl logs -f deploy/api -n carmarketplace              # app logs + one line per GC
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: carmarketplace
+spec:
+  replicas: 1 # scale with: kubectl scale deploy/api -n carmarketplace --replicas=3
+  # Recreate: stop the old pod before starting the new one. The default (rolling update) runs both at once,
+  # which needs double the memory reservation, and this single-node dev cluster doesn't have it.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+      annotations: # Prometheus scrapes pods that carry these
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /actuator/prometheus
+    spec:
+      containers:
+        - name: api
+          image: carmarketplace-api:dev
+          imagePullPolicy: Never # the locally built image: OrbStack's Kubernetes shares Docker's images
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: api-env # DB_URL, created from k8s/dev/api.env (not in git)
+          env:
+            # JVM flags. `java` reads this variable at startup, so changing it needs no rebuild.
+            #   UseG1GC: pick the collector ourselves. With less than ~1.8 GB of memory the JVM silently
+            #     falls back to Serial GC (one thread, stops the whole app), unlike on your 24 GB Mac.
+            #   MaxRAMPercentage=50: heap = 50% of the container's memory limit; the rest is for
+            #     metaspace, thread stacks, JIT code, the agents and the embedding model (native memory)
+            #   -Xlog:gc: one log line per garbage collection
+            #   -javaagent: tracing and profiling, see the Dockerfile
+            - name: JAVA_TOOL_OPTIONS
+              value: >-
+                -XX:+UseG1GC
+                -XX:MaxRAMPercentage=50
+                -Xlog:gc:stdout:time,level
+                -javaagent:/app/agents/opentelemetry-javaagent.jar
+                -javaagent:/app/agents/pyroscope.jar
+            # Tracing (OpenTelemetry agent → Tempo)
+            - name: OTEL_SERVICE_NAME
+              value: api
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318
+            - name: OTEL_METRICS_EXPORTER
+              value: none # metrics go through Prometheus instead
+            - name: OTEL_LOGS_EXPORTER
+              value: none
+            # Profiling (Pyroscope agent → Pyroscope)
+            - name: PYROSCOPE_APPLICATION_NAME
+              value: api
+            - name: PYROSCOPE_SERVER_ADDRESS
+              value: http://pyroscope:4040
+            - name: PYROSCOPE_FORMAT
+              value: jfr
+            - name: PYROSCOPE_PROFILER_EVENT
+              value: itimer # CPU time per method
+            - name: PYROSCOPE_PROFILER_ALLOC
+              value: 512k # which code allocates memory (one sample per 512 KB)
+            - name: PYROSCOPE_PROFILER_LOCK
+              value: 10ms # threads waiting on locks for more than 10 ms
+            # CSV for POST /admin/seed, from the datasets folder mounted below
+            - name: SEED_FILE
+              value: /data/vehicles.csv
+            # Search: Elasticsearch (BM25), Qdrant (vectors), and the model for query vectors
+            - name: ELASTICSEARCH_URIS
+              value: http://elasticsearch:9200
+            - name: QDRANT_HOST
+              value: qdrant
+            - name: MODEL_DIR
+              value: /app/model
+            - name: MALLOC_ARENA_MAX
+              value: "2"
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi # reserved for scheduling; the JVM may grow to the limit
+            limits:
+              memory: 1Gi
+              # No CPU limit on purpose: a CPU limit throttles the JVM, which looks just like GC pauses in p99.
+          startupProbe: # the agents make startup slower: allow up to 2 minutes
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe: # restart the pod if the app hangs
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 10
+          readinessProbe: # send traffic only when the app is ready
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+          volumeMounts:
+            - name: datasets
+              mountPath: /data
+              readOnly: true
+      volumes:
+        # The project's datasets/ folder on your Mac. OrbStack shares Mac folders with Kubernetes,
+        # so the 1.4 GB CSV doesn't have to be copied into the image. Dev only: this path is machine-specific.
+        - name: datasets
+          hostPath:
+            path: /Users/lithasan/Desktop/JVM/kotlin-hybrid-search/datasets
+            type: Directory
+
+---
+# The ingest worker: consumes vehicle.events from Kafka. A separate program with its own JVM.
+#   docker build -f ingest-worker/Dockerfile -t carmarketplace-ingest-worker:dev .
+#   kubectl rollout restart deploy/ingest-worker -n carmarketplace
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest-worker
+  namespace: carmarketplace
+spec:
+  # The topic has 3 partitions, so up to 3 workers share the load; a 4th would sit idle.
+  #   kubectl scale deploy/ingest-worker -n carmarketplace --replicas=3
+  replicas: 1
+  # Recreate: stop the old pod before starting the new one. The default (rolling update) runs both at once,
+  # which needs double the memory reservation, and this single-node dev cluster doesn't have it.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ingest-worker
+  template:
+    metadata:
+      labels:
+        app: ingest-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /actuator/prometheus
+    spec:
+      enableServiceLinks: false # no injected KAFKA_* variables
+      containers:
+        - name: ingest-worker
+          image: carmarketplace-ingest-worker:dev
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: JAVA_TOOL_OPTIONS
+              value: >-
+                -XX:+UseG1GC
+                -XX:MaxRAMPercentage=50
+                -Xlog:gc:stdout:time,level
+                -javaagent:/app/agents/opentelemetry-javaagent.jar
+                -javaagent:/app/agents/pyroscope.jar
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: kafka:9092
+            - name: ELASTICSEARCH_URIS
+              value: http://elasticsearch:9200
+            - name: QDRANT_HOST
+              value: qdrant
+            - name: MODEL_DIR
+              value: /app/model
+            # glibc keeps a memory pool per thread; with many threads that fragments native memory. 2 pools is the usual JVM fix.
+            - name: MALLOC_ARENA_MAX
+              value: "2"
+            - name: OTEL_SERVICE_NAME
+              value: ingest-worker
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318
+            - name: OTEL_METRICS_EXPORTER
+              value: none
+            - name: OTEL_LOGS_EXPORTER
+              value: none
+            - name: OTEL_TRACES_SAMPLER
+              value: parentbased_traceidratio
+            - name: OTEL_TRACES_SAMPLER_ARG
+              value: "0.01" # trace 1% of events: 426k events would otherwise mean 426k traces
+            - name: PYROSCOPE_APPLICATION_NAME
+              value: ingest-worker
+            - name: PYROSCOPE_SERVER_ADDRESS
+              value: http://pyroscope:4040
+            - name: PYROSCOPE_FORMAT
+              value: jfr
+            - name: PYROSCOPE_PROFILER_EVENT
+              value: itimer
+            - name: PYROSCOPE_PROFILER_ALLOC
+              value: 512k
+            - name: PYROSCOPE_PROFILER_LOCK
+              value: 10ms
+          resources:
+            # Heap = 50% of the limit: the other half is for the embedding model, which runs in native memory
+            requests:
+              cpu: 500m # embedding is CPU-heavy; no CPU limit, so it may use more when the node is idle
+              memory: 384Mi
+            limits:
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5

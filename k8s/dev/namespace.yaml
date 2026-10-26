@@ -1,0 +1,6 @@
+# Everything for the dev environment lives in this namespace.
+# Apply this file first: the others refer to it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: carmarketplace

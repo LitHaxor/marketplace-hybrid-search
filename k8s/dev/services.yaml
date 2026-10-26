@@ -1,0 +1,16 @@
+# How our application is reached:
+#   inside the cluster: http://api:8080
+#   from the Mac:       http://localhost:8080   (OrbStack publishes LoadBalancer services on localhost)
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: carmarketplace
+spec:
+  type: LoadBalancer
+  selector:
+    app: api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
