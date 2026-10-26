@@ -25,6 +25,7 @@ It is loaded with **426,880 real Craigslist car ads**.
 - [Quick start on OrbStack](#quick-start-on-orbstack)
 - [Install on minikube](#install-on-minikube)
 - [Local development](#local-development)
+- [Tests and CI](#tests-and-ci)
 - [Database migrations](#database-migrations)
 - [API](#api)
 - [Observability](#observability)
@@ -218,9 +219,12 @@ Both agents attach through `JAVA_TOOL_OPTIONS`, so the code has no tracing or pr
 ├── src/main/resources/
 │   ├── application.yaml
 │   └── db/changelog/           generated SQL migrations (Liquibase formatted SQL)
-├── src/test/kotlin/no/carmarketplace/Migrations.kt   migrate-generate / up / down
+├── src/test/kotlin/no/carmarketplace/
+│   ├── Migrations.kt           migrate-generate / up / down
+│   └── ...Test.kt, support/    API tests (Testcontainers Postgres)
 ├── embedding/                  shared library: WordPiece tokenizer + ONNX embedder (+ tests)
-├── ingest-worker/              Kafka consumer → Elasticsearch + Qdrant (own Dockerfile)
+├── ingest-worker/              Kafka consumer → Elasticsearch + Qdrant (own Dockerfile, + tests)
+├── .github/workflows/ci.yml    CI: build + tests, Docker images
 ├── k8s/dev/
 │   ├── namespace.yaml          carmarketplace
 │   ├── deployment.yaml         api + ingest-worker
@@ -448,7 +452,7 @@ Keep the infrastructure in Kubernetes and run one app from Gradle, with fast res
 ```bash
 ./gradlew :bootRun                  # API on :8081 (8080 is the API in the cluster)
 ./gradlew :ingest-worker:bootRun    # worker on :8082, reads Kafka on localhost:29092
-./gradlew test                      # tokenizer + embedding tests (downloads the model first)
+./gradlew build                     # compile + all tests (needs Docker), see Tests and CI
 ```
 
 - **Use the leading `:`.** `bootRun` without it runs in every module, so both apps would start.
@@ -458,6 +462,47 @@ Keep the infrastructure in Kubernetes and run one app from Gradle, with fast res
   kubectl scale deploy/ingest-worker -n carmarketplace --replicas=0
   ```
 - **Both local runs use the same JVM flags as the pods:** G1, GC logging, both agents. Each GC prints one line to the console.
+
+---
+
+## Tests and CI
+
+```bash
+./gradlew build                                   # everything CI runs: compile, 34 tests, both jars
+./gradlew :test                                   # API only
+./gradlew :ingest-worker:test --tests '*Processor*'   # one class
+```
+
+Integration tests use [Testcontainers](https://testcontainers.com): they start real Postgres, Kafka, Elasticsearch and Qdrant (the same versions as `k8s/dev`) in Docker, so **Docker must be running**. They don't need the Kubernetes cluster. The first run also downloads the embedding model. A full run takes about 1 minute once images are cached.
+
+| Module | Test | What it proves |
+|---|---|---|
+| API | `MigrationsTest` | every migration applies to an empty database, rolls back completely, and applies again; every entity property has a column; `@Index` indexes exist |
+| API | `VehicleApiTest` | over HTTP: create → `VehicleCreated` on the changes lane; sold → version + 1 and `VehicleSold` on the priority lane; selling twice is a no-op; unknown id → 404; bad JSON → 400 with nothing saved; paging and clamping; lanes switched off → bulk lane; the event JSON has every field the worker reads |
+| API | `CsvSeederTest` | CSV cells map to fields (`2016.0` → 2016, quoted commas, empty or broken cells → null); seeding again skips loaded cars; the limit; seeded events use the bulk lane |
+| API | `OutboxCleanerTest` | deletes events older than 5 minutes across several batches, keeps recent ones |
+| API | `ReciprocalRankFusionTest` | RRF scores and ordering (unit, no Docker) |
+| worker | `VehicleEventJsonTest` | reads the API's event JSON; title and search-document shaping (unit, no Docker) |
+| worker | `VehicleEventProcessorTest` | active car → BM25 document + vector with filter fields; sold → `SOLD` in Elasticsearch and removed from Qdrant; a late older event can't bring a sold car back; a redelivered event repairs a missing vector (`external_gte`); an invalid message is skipped without dropping its batch |
+| worker | `LaneListenersTest` | end to end through Kafka: events on all three lane topics reach both indexes, and freshness is recorded per lane |
+| embedding | `TextEmbedderTest` | tokenizer matches BERT's ids, truncation, similar texts get closer vectors |
+
+The event JSON is the contract between two separately deployed apps, so both sides test it. `VehicleApiTest` checks the fields the API writes, and the worker's tests read that same shape.
+
+**CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs on every pull request and on every push to `main`:
+
+| Check | What it does |
+|---|---|
+| `Build and test` | `./gradlew build` on Java 25: all modules, all tests. Test reports are uploaded when it fails |
+| `Docker image (api)`, `Docker image (ingest-worker)` | builds both production images (not pushed), so a broken Dockerfile fails the PR |
+
+**`main` is protected:**
+- every change goes through a pull request
+- the three checks above must pass on a branch that is up to date with `main`
+- review conversations must be resolved
+- force-pushes and deleting `main` are blocked, for admins too
+
+No approving review is required, so a solo maintainer can still merge their own PRs once CI is green.
 
 ---
 
@@ -730,7 +775,8 @@ These are known gaps in the current code:
 - [ ] **409 on conflicts.** A version conflict on update should be a 409; today it's a 500.
 - [ ] **An update endpoint** (price change, edit description).
 - [ ] **Auth** on write endpoints, and `/admin/seed` removed.
-- [ ] **Tests for the API and worker, and CI.** Today only the `embedding` module has tests.
+- [ ] **A search integration test.** `/search` itself (Elasticsearch + Qdrant + RRF end to end) has no test yet; only RRF is unit-tested.
+- [ ] **Consistent manufacturer case.** The search filter lowercases `manufacturer`, but the worker indexes it as sent. Cars created as `"Toyota"` through the API can't be found with `manufacturer=toyota`. The CSV data is already lowercase.
 - [ ] **Data quality.** The CSV has reposts, $0 prices and missing manufacturers.
 - [ ] **Worker throughput.** Qdrant upsert p95 is about 1.3 s per batch, likely the worker's next bottleneck.
 - [ ] **Query-embedding cache** (Caffeine, size-bounded, key = model version + normalized query). Measure it against a load-test baseline.
