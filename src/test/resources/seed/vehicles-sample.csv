@@ -1,0 +1,4 @@
+id,url,region,price,year,manufacturer,model,description,lat,long
+7001,https://example.org/7001,new york,12500,2016.0,toyota,rav4 xle,"One owner, full service history",40.73,-73.99
+7002,https://example.org/7002,new york,0,,ford,,,,
+7003,https://example.org/7003,new york,abc,2012.0,honda,civic,Clean title,not-a-number,-74.0
