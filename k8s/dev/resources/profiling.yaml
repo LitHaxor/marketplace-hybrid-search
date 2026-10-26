@@ -1,0 +1,55 @@
+# Continuous profiling: Pyroscope stores flame graphs. Each JVM sends them with the Pyroscope Java agent
+# (built on async-profiler): CPU time, memory allocation and lock waits, per method, all the time.
+# View them in Grafana: Explore → Pyroscope, or Drilldown → Profiles.
+apiVersion: v1
+kind: Service
+metadata:
+  name: pyroscope
+  namespace: carmarketplace
+spec:
+  type: LoadBalancer
+  selector:
+    app: pyroscope
+  ports:
+    - name: http
+      port: 4040
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pyroscope
+  namespace: carmarketplace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pyroscope
+  template:
+    metadata:
+      labels:
+        app: pyroscope
+    spec:
+      containers:
+        - name: pyroscope
+          image: grafana/pyroscope:2.4.1
+          ports:
+            - name: http
+              containerPort: 4040
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {} # profiles are lost when the pod restarts: fine for dev

@@ -1,0 +1,93 @@
+# Tracing: Tempo stores traces. Each JVM sends them with the OpenTelemetry Java agent (OTLP).
+# A trace = one request's path: HTTP → service → each SQL query, with the time spent in each.
+# View them in Grafana: Explore → Tempo.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-config
+  namespace: carmarketplace
+data:
+  tempo.yaml: |
+    server:
+      http_listen_port: 3200          # query API, used by Grafana
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 0.0.0.0:4317  # OTLP over gRPC
+            http:
+              endpoint: 0.0.0.0:4318  # OTLP over HTTP (what the Java agent uses by default)
+    storage:
+      trace:
+        backend: local                # traces on the pod's disk: fine for dev
+        wal:
+          path: /var/tempo/wal
+        local:
+          path: /var/tempo/blocks
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  namespace: carmarketplace
+spec:
+  type: LoadBalancer # also reachable from the Mac, e.g. for `gradle bootRun` with the agent
+  selector:
+    app: tempo
+  ports:
+    - name: http
+      port: 3200
+      targetPort: http
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tempo
+  namespace: carmarketplace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tempo
+  template:
+    metadata:
+      labels:
+        app: tempo
+    spec:
+      securityContext:
+        fsGroup: 10001 # Tempo runs as user 10001
+      containers:
+        - name: tempo
+          image: grafana/tempo:3.1.1
+          args: ["-config.file=/etc/tempo/tempo.yaml"]
+          ports:
+            - name: http
+              containerPort: 3200
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tempo
+            - name: data
+              mountPath: /var/tempo
+      volumes:
+        - name: config
+          configMap:
+            name: tempo-config
+        - name: data
+          emptyDir: {} # traces are lost when the pod restarts: fine for dev
