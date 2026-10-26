@@ -1,0 +1,77 @@
+# Postgres: the source of truth.
+# wal_level=logical makes Postgres write full row changes to its change log (WAL),
+# which is what Debezium reads for CDC.
+#
+# Credentials come from the Secret postgres-credentials, created from k8s/dev/postgres.env (not in git).
+#   from the cluster: postgres:5433
+#   from the Mac:     localhost:5433   (5432 is your Homebrew Postgres)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: carmarketplace
+spec:
+  type: LoadBalancer
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5433
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: carmarketplace
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17.11
+          args:
+            - -c
+            - wal_level=logical # full row changes in the WAL, for Debezium
+            - -c
+            - max_replication_slots=4 # one per CDC connector
+            - -c
+            - max_wal_senders=4
+          envFrom:
+            - secretRef:
+                name: postgres-credentials # POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata # a subfolder: the volume's root isn't empty
+          ports:
+            - name: postgres
+              containerPort: 5432
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
