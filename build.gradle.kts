@@ -29,13 +29,26 @@ dependencies {
     runtimeOnly("org.postgresql:postgresql")
     runtimeOnly("io.micrometer:micrometer-registry-prometheus") // /actuator/prometheus for Prometheus to scrape
 
-
     testImplementation("org.liquibase:liquibase-core")
+    testImplementation("org.springframework.boot:spring-boot-starter-webmvc-test") // @SpringBootTest, MockMvc, JUnit
+    testImplementation("org.jetbrains.kotlin:kotlin-test-junit5")
+    testImplementation("org.testcontainers:testcontainers-postgresql") // a real Postgres in Docker for integration tests
+    testImplementation("org.awaitility:awaitility") // wait for background work, e.g. the CSV seeder
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 // Java 22+ warns (and will later refuse) when a library loads native code. ONNX Runtime and the profiler do.
 tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {
     manifest { attributes("Enable-Native-Access" to "ALL-UNNAMED") }
+}
+
+// Unit tests, plus integration tests against a real Postgres (Testcontainers: needs Docker).
+// The search beans load the embedding model at startup, so the tests need the model too.
+tasks.withType<Test> {
+    useJUnitPlatform()
+    dependsOn(":embedding:downloadModel")
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    environment("MODEL_DIR", project(":embedding").layout.buildDirectory.dir("model").get().asFile.path)
 }
 
 // ---------- Observability agents ----------

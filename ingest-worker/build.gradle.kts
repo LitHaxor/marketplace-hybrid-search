@@ -28,6 +28,21 @@ dependencies {
     implementation("io.qdrant:client:1.20.0") // vector index, over gRPC
     implementation(project(":embedding")) // runs the embedding model inside this JVM
     runtimeOnly("io.micrometer:micrometer-registry-prometheus")
+
+    testImplementation("org.springframework.boot:spring-boot-starter-kafka-test") // @SpringBootTest, JUnit, Kafka test utils
+    testImplementation("org.jetbrains.kotlin:kotlin-test-junit5")
+    testImplementation("org.testcontainers:testcontainers-kafka") // real Kafka, Elasticsearch and Qdrant in Docker
+    testImplementation("org.awaitility:awaitility") // wait for the listeners to consume
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+
+// Unit tests, plus integration tests against real Kafka, Elasticsearch and Qdrant (Testcontainers: needs Docker)
+// and the real embedding model.
+tasks.withType<Test> {
+    useJUnitPlatform()
+    dependsOn(":embedding:downloadModel")
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    environment("MODEL_DIR", project(":embedding").layout.buildDirectory.dir("model").get().asFile.path)
 }
 
 // `gradle :ingest-worker:bootRun`: runs on your Mac, reads Kafka on localhost:29092,
