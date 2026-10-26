@@ -18,7 +18,8 @@ class KafkaErrorHandling {
         // with no limit. Kafka keeps the events, so nothing is lost; the lane waits and its lag grows.
         val backOff: ExponentialBackOff = ExponentialBackOff(1_000, 2.0).apply { maxInterval = 30_000 }
         return DefaultErrorHandler(backOff).apply {
-            // A message that isn't valid JSON will never succeed: skip it instead of blocking the lane forever.
+            // Invalid messages are skipped one by one in VehicleEventProcessor. If a JSON error still gets here,
+            // retrying can't fix it: skip the batch instead of blocking the lane forever.
             addNotRetryableExceptions(JacksonException::class.java)
         }
     }
