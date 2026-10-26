@@ -39,7 +39,7 @@ import org.springframework.data.relational.core.mapping.RelationalPersistentEnti
 import org.springframework.data.relational.core.mapping.RelationalPersistentProperty
 
 // Every entity that should have a table. Add new entity classes here.
-private val ENTITIES: Set<Class<*>> = setOf(Vehicle::class.java, OutboxEvent::class.java)
+internal val ENTITIES: Set<Class<*>> = setOf(Vehicle::class.java, OutboxEvent::class.java)
 
 private const val RESOURCES: String = "src/main/resources"
 private const val CHANGELOG: String = "db/changelog/db.changelog-master.yaml"
@@ -261,7 +261,8 @@ private fun down() {
     withDatabase { database: Database -> liquibase("rollbackCount", database, mapOf("count" to 1)) }
 }
 
-private fun liquibase(command: String, database: Database, arguments: Map<String, Any> = emptyMap()) {
+// internal: the integration tests migrate their Postgres containers with this same code
+internal fun liquibase(command: String, database: Database, arguments: Map<String, Any> = emptyMap()) {
     Scope.child(Scope.Attr.resourceAccessor, DirectoryResourceAccessor(File(RESOURCES))) {
         val scope: CommandScope = CommandScope(command)
             .addArgumentValue("changelogFile", CHANGELOG)
@@ -278,8 +279,8 @@ private fun parse(changeLogFile: File): DatabaseChangeLog {
         .parse(changeLogFile.name, ChangeLogParameters(), folder)
 }
 
-private fun withDatabase(block: (Database) -> Unit) {
-    DriverManager.getConnection(dbUrl()).use { connection: Connection ->
+internal fun withDatabase(url: String = dbUrl(), block: (Database) -> Unit) {
+    DriverManager.getConnection(url).use { connection: Connection ->
         val database: Database = DatabaseFactory.getInstance()
             .findCorrectDatabaseImplementation(JdbcConnection(connection))
         block(database)
