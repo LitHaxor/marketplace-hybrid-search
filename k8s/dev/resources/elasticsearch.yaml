@@ -1,0 +1,164 @@
+# Elasticsearch: lexical (BM25) search, filters and facets.
+# Single node with security off: dev only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  namespace: carmarketplace
+spec:
+  type: LoadBalancer # OrbStack publishes LoadBalancer services on localhost
+  selector:
+    app: elasticsearch
+  ports:
+    - name: http
+      port: 9200
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet # StatefulSet, not Deployment: it keeps its disk across restarts
+metadata:
+  name: elasticsearch
+  namespace: carmarketplace
+spec:
+  serviceName: elasticsearch
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+    spec:
+      securityContext:
+        fsGroup: 1000 # Elasticsearch runs as user 1000 and must be able to write its data folder
+      containers:
+        - name: elasticsearch
+          image: elasticsearch:9.5.5
+          env:
+            - name: discovery.type
+              value: single-node # one node: no cluster forming, no production bootstrap checks
+            - name: xpack.security.enabled
+              value: "false" # plain http, no passwords
+            - name: ES_JAVA_OPTS
+              value: "-Xms1g -Xmx1g" # JVM heap; keep it at about half the container memory
+            # elasticvue (below) runs in your browser and calls Elasticsearch directly: allow that origin
+            - name: http.cors.enabled
+              value: "true"
+            - name: http.cors.allow-origin
+              value: http://localhost:8091
+            - name: http.cors.allow-headers
+              value: X-Requested-With,Content-Type,Content-Length,Authorization
+          ports:
+            - name: http
+              containerPort: 9200
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi # reserved for scheduling; it may use up to the limit
+            limits:
+              memory: 2Gi
+          readinessProbe: # traffic only after Elasticsearch answers
+            httpGet:
+              path: /_cluster/health?local=true
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/elasticsearch/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+# ---------------- Metrics: Elasticsearch is a JVM too ----------------
+# The exporter asks Elasticsearch for its stats and serves them to Prometheus:
+# JVM heap and GC, indexing and search rates, refresh/merge time, thread-pool rejections.
+# They appear in Grafana's "JVM and HTTP" dashboard, in the Elasticsearch row.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elasticsearch-exporter
+  namespace: carmarketplace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch-exporter
+  template:
+    metadata:
+      labels:
+        app: elasticsearch-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9114"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: exporter
+          image: prometheuscommunity/elasticsearch-exporter:v1.11.0
+          args:
+            - --es.uri=http://elasticsearch:9200
+            - --es.indices # per-index stats, e.g. document count of "vehicles"
+          ports:
+            - name: metrics
+              containerPort: 9114
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+---
+# ---------------- elasticvue: a small web UI to browse Elasticsearch ----------------
+# http://localhost:8091 : indices, documents, mappings, search, cluster health
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticvue
+  namespace: carmarketplace
+spec:
+  type: LoadBalancer
+  selector:
+    app: elasticvue
+  ports:
+    - name: http
+      port: 8091
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elasticvue
+  namespace: carmarketplace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticvue
+  template:
+    metadata:
+      labels:
+        app: elasticvue
+    spec:
+      containers:
+        - name: elasticvue
+          image: cars10/elasticvue:1.16.0
+          env:
+            # Preconfigured connection. It's your browser that connects, so it uses localhost:9200.
+            - name: ELASTICVUE_CLUSTERS
+              value: '[{"name": "carmarketplace", "uri": "http://localhost:9200"}]'
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
