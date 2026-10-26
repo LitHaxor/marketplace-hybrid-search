@@ -1,0 +1,1758 @@
+# Monitoring: Prometheus collects metrics, Grafana shows them.
+#
+# Prometheus finds pods to scrape by their annotations (see deployment.yaml):
+#   prometheus.io/scrape: "true", prometheus.io/port, prometheus.io/path
+# Every scraped pod gets an `app` label from its own `app` label, so one dashboard serves every JVM.
+#
+# Grafana:    http://localhost:3000   (no login in dev)
+# Prometheus: http://localhost:9090
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: carmarketplace
+---
+# Prometheus may list pods in this namespace (to discover what to scrape), nothing more.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus
+  namespace: carmarketplace
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus
+  namespace: carmarketplace
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: carmarketplace
+roleRef:
+  kind: Role
+  name: prometheus
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: carmarketplace
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s               # short interval: you see GC and spikes almost live
+    scrape_configs:
+      - job_name: pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [carmarketplace]
+        relabel_configs:
+          # only pods that ask for it
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          # metrics path from the annotation (/actuator/prometheus for Spring)
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            target_label: __metrics_path__
+            regex: (.+)
+          # pod IP + port from the annotation
+          - source_labels: [__meta_kubernetes_pod_ip, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            regex: (.+);(.+)
+            replacement: $1:$2
+            target_label: __address__
+          # app and pod labels, for the dashboard's App dropdown
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+      # The API on your Mac (`gradle bootRun`, port 8081). Shows DOWN when it isn't running: that's fine.
+      - job_name: local-dev
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: ["host.docker.internal:8081"]
+            labels:
+              app: api-local
+          - targets: ["host.docker.internal:8082"]
+            labels:
+              app: ingest-worker-local
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: carmarketplace
+spec:
+  type: LoadBalancer
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: carmarketplace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.9.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=2d
+          ports:
+            - name: http
+              containerPort: 9090
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          emptyDir: {} # metrics are lost when the pod restarts: fine for dev
+---
+# Grafana data sources: metrics (Prometheus), traces (Tempo), profiles (Pyroscope).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: carmarketplace
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        url: http://prometheus:9090
+        isDefault: true
+      - name: Tempo
+        uid: tempo
+        type: tempo
+        url: http://tempo:3200
+      - name: Pyroscope
+        uid: pyroscope
+        type: grafana-pyroscope-datasource
+        url: http://pyroscope:4040
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: carmarketplace
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: dashboards
+        folder: carmarketplace
+        type: file
+        options:
+          path: /var/lib/grafana/dashboards
+---
+# The "JVM and HTTP" dashboard. Pick the app (JVM) at the top.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: carmarketplace
+data:
+  jvm.json: |
+    {
+      "uid": "jvm",
+      "title": "JVM and HTTP",
+      "tags": [
+        "jvm"
+      ],
+      "schemaVersion": 39,
+      "editable": true,
+      "time": {
+        "from": "now-15m",
+        "to": "now"
+      },
+      "refresh": "5s",
+      "templating": {
+        "list": [
+          {
+            "name": "app",
+            "label": "App",
+            "type": "query",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prometheus"
+            },
+            "query": {
+              "qryType": 1,
+              "query": "label_values(jvm_memory_used_bytes, app)",
+              "refId": "app"
+            },
+            "definition": "label_values(jvm_memory_used_bytes, app)",
+            "refresh": 2
+          }
+        ]
+      },
+      "panels": [
+        {
+          "type": "row",
+          "title": "Traffic: rate, errors, duration",
+          "collapsed": false,
+          "gridPos": {
+            "x": 0,
+            "y": 0,
+            "w": 24,
+            "h": 1
+          },
+          "panels": []
+        },
+        {
+          "type": "timeseries",
+          "title": "Requests per second",
+          "description": "How much traffic each endpoint gets.",
+          "gridPos": {
+            "x": 0,
+            "y": 1,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "fillOpacity": 5,
+                "stacking": {
+                  "mode": "none"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (method, uri) (rate(http_server_requests_seconds_count{app=\"$app\", uri!~\"/actuator.*\"}[1m]))",
+              "legendFormat": "{{method}} {{uri}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Latency p50 / p95 / p99",
+          "description": "p99 = the slowest 1% of requests. GC pauses and CPU throttling show up here first.",
+          "gridPos": {
+            "x": 8,
+            "y": 1,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 5,
+                "stacking": {
+                  "mode": "none"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(http_server_requests_seconds_bucket{app=\"$app\", uri!~\"/actuator.*\"}[1m])))",
+              "legendFormat": "p50"
+            },
+            {
+              "refId": "B",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{app=\"$app\", uri!~\"/actuator.*\"}[1m])))",
+              "legendFormat": "p95"
+            },
+            {
+              "refId": "C",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{app=\"$app\", uri!~\"/actuator.*\"}[1m])))",
+              "legendFormat": "p99"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Errors per second (5xx)",
+          "description": "",
+          "gridPos": {
+            "x": 16,
+            "y": 1,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "fillOpacity": 5,
+                "stacking": {
+                  "mode": "none"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (uri, status) (rate(http_server_requests_seconds_count{app=\"$app\", status=~\"5..\"}[1m]))",
+              "legendFormat": "{{status}} {{uri}}"
+            }
+          ]
+        },
+        {
+          "type": "row",
+          "title": "JVM memory and garbage collection",
+          "collapsed": false,
+          "gridPos": {
+            "x": 0,
+            "y": 9,
+            "w": 24,
+            "h": 1
+          },
+          "panels": []
+        },
+        {
+          "type": "timeseries",
+          "title": "Heap used by area",
+          "description": "Eden = new objects (fills fast, emptied by young GC). Old Gen = survivors. A rising Old Gen floor = possible leak.",
+          "gridPos": {
+            "x": 0,
+            "y": 10,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "fillOpacity": 25,
+                "stacking": {
+                  "mode": "normal"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (id) (jvm_memory_used_bytes{app=\"$app\", area=\"heap\"})",
+              "legendFormat": "{{id}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Allocation rate",
+          "description": "Bytes of new objects per second. Higher allocation = more frequent GC. The usual root cause of GC trouble.",
+          "gridPos": {
+            "x": 8,
+            "y": 10,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "Bps",
+              "custom": {
+                "fillOpacity": 5,
+                "stacking": {
+                  "mode": "none"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "rate(jvm_gc_memory_allocated_bytes_total{app=\"$app\"}[1m])",
+              "legendFormat": "allocated/s"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "GC pauses per second",
+          "description": "",
+          "gridPos": {
+            "x": 16,
+            "y": 10,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 5,
+                "stacking": {
+                  "mode": "none"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (gc, action) (rate(jvm_gc_pause_seconds_count{app=\"$app\"}[1m]))",
+              "legendFormat": "{{gc}}: {{action}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Longest GC pause (recent)",
+          "description": "While a GC pause runs, the app is stopped. Compare with p99 latency.",
+          "gridPos": {
+            "x": 0,
+            "y": 18,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 5,
+                "stacking": {
+                  "mode": "none"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max by (gc, action) (jvm_gc_pause_seconds_max{app=\"$app\"})",
+              "legendFormat": "{{gc}}: {{action}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Non-heap memory",
+          "description": "Metaspace = loaded classes, CodeCache = JIT-compiled code.",
+          "gridPos": {
+            "x": 8,
+            "y": 18,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "fillOpacity": 25,
+                "stacking": {
+                  "mode": "normal"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (id) (jvm_memory_used_bytes{app=\"$app\", area=\"nonheap\"})",
+              "legendFormat": "{{id}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "GC overhead (CPU spent collecting)",
+          "description": "",
+          "gridPos": {
+            "x": 16,
+            "y": 18,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 5,
+                "stacking": {
+                  "mode": "none"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(jvm_gc_pause_seconds_sum{app=\"$app\"}[1m]))",
+              "legendFormat": "seconds paused per second"
+            }
+          ]
+        },
+        {
+          "type": "row",
+          "title": "Threads, CPU and database connections",
+          "collapsed": false,
+          "gridPos": {
+            "x": 0,
+            "y": 26,
+            "w": 24,
+            "h": 1
+          },
+          "panels": []
+        },
+        {
+          "type": "timeseries",
+          "title": "JVM threads",
+          "description": "Platform threads only. Virtual threads don't count here: that's the point of them.",
+          "gridPos": {
+            "x": 0,
+            "y": 27,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 5,
+                "stacking": {
+                  "mode": "none"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "jvm_threads_live_threads{app=\"$app\"}",
+              "legendFormat": "live"
+            },
+            {
+              "refId": "B",
+              "expr": "jvm_threads_daemon_threads{app=\"$app\"}",
+              "legendFormat": "daemon"
+            },
+            {
+              "refId": "C",
+              "expr": "jvm_threads_peak_threads{app=\"$app\"}",
+              "legendFormat": "peak"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "CPU",
+          "description": "",
+          "gridPos": {
+            "x": 8,
+            "y": 27,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 5,
+                "stacking": {
+                  "mode": "none"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "process_cpu_usage{app=\"$app\"}",
+              "legendFormat": "this JVM"
+            },
+            {
+              "refId": "B",
+              "expr": "system_cpu_usage{app=\"$app\"}",
+              "legendFormat": "whole machine"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Database connection pool",
+          "description": "Pending > 0 = requests wait for the database pool: a bottleneck.",
+          "gridPos": {
+            "x": 16,
+            "y": 27,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 5,
+                "stacking": {
+                  "mode": "none"
+                }
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "hikaricp_connections_active{app=\"$app\"}",
+              "legendFormat": "active"
+            },
+            {
+              "refId": "B",
+              "expr": "hikaricp_connections_idle{app=\"$app\"}",
+              "legendFormat": "idle"
+            },
+            {
+              "refId": "C",
+              "expr": "hikaricp_connections_pending{app=\"$app\"}",
+              "legendFormat": "waiting for a connection"
+            }
+          ]
+        },
+        {
+          "type": "row",
+          "title": "Pipeline: seed \u2192 outbox \u2192 Kafka lanes \u2192 worker \u2192 Elasticsearch + Qdrant",
+          "collapsed": false,
+          "gridPos": {
+            "x": 0,
+            "y": 35,
+            "w": 24,
+            "h": 1
+          },
+          "panels": []
+        },
+        {
+          "type": "timeseries",
+          "title": "Freshness p95 by lane and event",
+          "description": "From database commit until both indexes have the change. Target for VehicleSold: under 2 s.",
+          "gridPos": {
+            "x": 0,
+            "y": 36,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.95, sum by (le, lane, type) (rate(ingest_freshness_seconds_bucket[1m])))",
+              "legendFormat": "{{lane}} {{type}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Sold cars indexed within 2 s",
+          "description": "The freshness SLO as one number: share of VehicleSold events indexed within 2 s.",
+          "gridPos": {
+            "x": 8,
+            "y": 36,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(ingest_freshness_seconds_bucket{type=\"VehicleSold\", le=\"2.0\"}[5m])) / sum(rate(ingest_freshness_seconds_count{type=\"VehicleSold\"}[5m]))",
+              "legendFormat": "within 2 s"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Consumer lag per topic (events waiting)",
+          "description": "Each lane is its own topic: a big bulk lag must not show up in vehicle.priority.",
+          "gridPos": {
+            "x": 16,
+            "y": 36,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (topic) (kafka_consumer_fetch_manager_records_lag{topic=~\"vehicle\\\\..*\"})",
+              "legendFormat": "{{topic}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Cars seeded per second (API)",
+          "description": "POST /admin/seed: vehicle + outbox row per second.",
+          "gridPos": {
+            "x": 0,
+            "y": 44,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(seed_vehicles_total{result=\"saved\"}[1m]))",
+              "legendFormat": "seeded"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Events indexed per second (worker)",
+          "description": "Stale = an event older than what the index has, correctly ignored.",
+          "gridPos": {
+            "x": 8,
+            "y": 44,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (lane) (rate(ingest_events_total{result=\"indexed\"}[1m]))",
+              "legendFormat": "{{lane}}"
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (lane) (rate(ingest_events_total{result=\"stale\"}[1m]))",
+              "legendFormat": "{{lane}} stale (older version)"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Embedding time per batch",
+          "description": "Running all-MiniLM-L6-v2 for one batch of up to 64 cars. The slowest step of the pipeline.",
+          "gridPos": {
+            "x": 16,
+            "y": 44,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (lane) (rate(ingest_embedding_seconds_sum[1m])) / sum by (lane) (rate(ingest_embedding_seconds_count[1m]))",
+              "legendFormat": "{{lane}}"
+            }
+          ]
+        },
+        {
+          "type": "row",
+          "title": "Elasticsearch (its own JVM, indexing and search)",
+          "collapsed": false,
+          "gridPos": {
+            "x": 0,
+            "y": 52,
+            "w": 24,
+            "h": 1
+          },
+          "panels": []
+        },
+        {
+          "type": "timeseries",
+          "title": "Elasticsearch heap",
+          "description": "Elasticsearch is a JVM too: 1 GB heap. The sawtooth is its own garbage collection.",
+          "gridPos": {
+            "x": 0,
+            "y": 53,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "elasticsearch_jvm_memory_used_bytes{area=\"heap\"}",
+              "legendFormat": "used"
+            },
+            {
+              "refId": "B",
+              "expr": "elasticsearch_jvm_memory_max_bytes{area=\"heap\"}",
+              "legendFormat": "max (-Xmx)"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Elasticsearch GC time",
+          "description": "Share of time spent in garbage collection. Old-generation GC here slows every search.",
+          "gridPos": {
+            "x": 8,
+            "y": 53,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (gc) (rate(elasticsearch_jvm_gc_collection_seconds_sum[1m]))",
+              "legendFormat": "{{gc}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Elasticsearch CPU",
+          "description": "Indexing (analyzing text, building segments) and merges use CPU.",
+          "gridPos": {
+            "x": 16,
+            "y": 53,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "elasticsearch_process_cpu_percent / 100",
+              "legendFormat": "cpu"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Documents indexed per second",
+          "description": "Writes coming from the ingest worker's bulk requests.",
+          "gridPos": {
+            "x": 0,
+            "y": 61,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(elasticsearch_indices_indexing_index_total[1m]))",
+              "legendFormat": "docs/s"
+            },
+            {
+              "refId": "B",
+              "expr": "sum(rate(elasticsearch_indices_indexing_index_time_seconds_total[1m])) / sum(rate(elasticsearch_indices_indexing_index_total[1m]))",
+              "legendFormat": "avg seconds per doc"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Searches per second and latency",
+          "description": "Becomes interesting once the search API exists.",
+          "gridPos": {
+            "x": 8,
+            "y": 61,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(elasticsearch_indices_search_query_total[1m]))",
+              "legendFormat": "queries/s"
+            },
+            {
+              "refId": "B",
+              "expr": "sum(rate(elasticsearch_indices_search_query_time_seconds[1m])) / sum(rate(elasticsearch_indices_search_query_total[1m]))",
+              "legendFormat": "avg seconds per query"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Rejected requests (thread pools full)",
+          "description": "Above 0 = Elasticsearch is overloaded and refusing work: backpressure for the worker.",
+          "gridPos": {
+            "x": 16,
+            "y": 61,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (type) (rate(elasticsearch_thread_pool_rejected_count{type=~\"write|search\"}[1m]))",
+              "legendFormat": "{{type}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Refresh and merge cost",
+          "description": "The price of the 1 s refresh (freshness): many small segments, then merging them.",
+          "gridPos": {
+            "x": 0,
+            "y": 69,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(elasticsearch_indices_refresh_time_seconds_total[1m]))",
+              "legendFormat": "refresh"
+            },
+            {
+              "refId": "B",
+              "expr": "sum(rate(elasticsearch_indices_merges_total_time_seconds_total[1m]))",
+              "legendFormat": "merges"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Documents in the vehicles index",
+          "description": "Should match the number of vehicles in Postgres.",
+          "gridPos": {
+            "x": 8,
+            "y": 69,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "elasticsearch_indices_docs_primary{index=\"vehicles\"}",
+              "legendFormat": "documents"
+            }
+          ]
+        },
+        {
+          "type": "row",
+          "title": "Qdrant (vector search)",
+          "collapsed": false,
+          "gridPos": {
+            "x": 0,
+            "y": 77,
+            "w": 24,
+            "h": 1
+          },
+          "panels": []
+        },
+        {
+          "type": "timeseries",
+          "title": "Points in the collection",
+          "description": "One point per ACTIVE car: id + 384-number vector + small payload. Sold cars are deleted.",
+          "gridPos": {
+            "x": 0,
+            "y": 78,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(collection_points{id=\"vehicles\"})",
+              "legendFormat": "points (active cars)"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Calls per second",
+          "description": "Upsert = the worker writing vectors. Search = the API's vector half. Delete = sold cars.",
+          "gridPos": {
+            "x": 8,
+            "y": 78,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (endpoint) (rate(grpc_responses_total[1m]))",
+              "legendFormat": "{{endpoint}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Call latency p95",
+          "description": "How long Qdrant takes per call, as Qdrant measures it (network to the caller not included).",
+          "gridPos": {
+            "x": 16,
+            "y": 78,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.95, sum by (le, endpoint) (rate(grpc_responses_duration_seconds_bucket[1m])))",
+              "legendFormat": "{{endpoint}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Failed calls",
+          "description": "gRPC status: 5 = not found (e.g. collection missing), 14 = unavailable, 4 = deadline exceeded.",
+          "gridPos": {
+            "x": 0,
+            "y": 86,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (endpoint, status) (rate(grpc_responses_total{status!=\"0\"}[5m]))",
+              "legendFormat": "{{endpoint}} status {{status}}"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Memory",
+          "description": "Qdrant is Rust, not a JVM: no heap or GC, it allocates and frees directly. int8 vectors + HNSW graph live here.",
+          "gridPos": {
+            "x": 8,
+            "y": 86,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "memory_resident_bytes",
+              "legendFormat": "resident (what the OS sees)"
+            },
+            {
+              "refId": "B",
+              "expr": "memory_allocated_bytes",
+              "legendFormat": "allocated by Qdrant"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Background work",
+          "description": "New points land in small segments first; optimizations build the HNSW graph for them later.",
+          "gridPos": {
+            "x": 16,
+            "y": 86,
+            "w": 8,
+            "h": 8
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 5
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(collection_running_optimizations)",
+              "legendFormat": "optimizations running (building HNSW, merging segments)"
+            },
+            {
+              "refId": "B",
+              "expr": "sum(collection_update_queue_length)",
+              "legendFormat": "writes waiting to be applied"
+            }
+          ]
+        }
+      ]
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: carmarketplace
+spec:
+  type: LoadBalancer
+  selector:
+    app: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: carmarketplace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:13.2.4
+          env:
+            # dev only: no login, everyone is admin
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: Admin
+            - name: GF_AUTH_DISABLE_LOGIN_FORM
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 3000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+      volumes:
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: grafana-dashboard-provider
+        - name: dashboards
+          configMap:
+            name: grafana-dashboards
