@@ -1,0 +1,11 @@
+.gradle/
+.kotlin/
+build/
+.idea/
+*.iml
+.DS_Store
+
+# local secrets and data, never committed
+.env
+k8s/dev/*.env
+datasets/
