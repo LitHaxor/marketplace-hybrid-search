@@ -1,0 +1,250 @@
+# Kafka + Debezium (CDC) + Kafka UI.
+#
+#   Kafka:    one broker in KRaft mode (no ZooKeeper).  cluster: kafka:9092   Mac: localhost:29092
+#   Debezium: Kafka Connect with the Debezium connectors. Reads Postgres's WAL, writes to Kafka.
+#             REST API to manage connectors: localhost:8083
+#   Kafka UI: topics, messages, consumer lag, connectors: http://localhost:8090
+#
+# enableServiceLinks: false on every pod: Kubernetes would otherwise inject variables like KAFKA_PORT and
+# CONNECT_PORT, and these images treat every KAFKA_* / CONNECT_* variable as configuration.
+
+# ---------------- Kafka ----------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: carmarketplace
+spec:
+  type: LoadBalancer
+  selector:
+    app: kafka
+  ports:
+    - name: internal # for pods in the cluster
+      port: 9092
+      targetPort: internal
+    - name: external # for programs on the Mac (e.g. the worker started with gradle bootRun)
+      port: 29092
+      targetPort: external
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: carmarketplace
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      enableServiceLinks: false
+      securityContext:
+        fsGroup: 1000 # Kafka runs as user 1000
+      containers:
+        - name: kafka
+          image: apache/kafka:4.4.0
+          env:
+            # One process is both broker (stores messages) and controller (cluster metadata, replaces ZooKeeper)
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: broker,controller
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: 1@localhost:9093
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: CONTROLLER
+            # Clients are told to reconnect at the "advertised" address, so pods and the Mac get different ones
+            - name: KAFKA_LISTENERS
+              value: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: INTERNAL
+            # One broker → every internal topic has 1 copy
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "0"
+            # New topics get 3 partitions: up to 3 workers can then consume one topic in parallel
+            - name: KAFKA_NUM_PARTITIONS
+              value: "3"
+            - name: KAFKA_LOG_DIRS
+              value: /var/lib/kafka/data
+            - name: KAFKA_LOG_RETENTION_HOURS
+              value: "24" # one full seed is ~1.2 GB of events; the default 7 days would pile them up
+            - name: KAFKA_HEAP_OPTS
+              value: "-Xms256m -Xmx256m" # Kafka relies on the OS page cache, not a big heap
+          ports:
+            - name: internal
+              containerPort: 9092
+            - name: external
+              containerPort: 29092
+          resources:
+            requests:
+              cpu: 250m
+              memory: 384Mi
+            limits:
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: internal
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+# ---------------- Debezium (Kafka Connect) ----------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: connect
+  namespace: carmarketplace
+spec:
+  type: LoadBalancer
+  selector:
+    app: connect
+  ports:
+    - name: http
+      port: 8083
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: connect
+  namespace: carmarketplace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: connect
+  template:
+    metadata:
+      labels:
+        app: connect
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: connect
+          image: quay.io/debezium/connect:3.7.0.Final
+          envFrom:
+            - secretRef:
+                name: postgres-credentials # connectors read them as ${env:POSTGRES_USER} etc.: no passwords in config
+          env:
+            - name: BOOTSTRAP_SERVERS
+              value: kafka:9092
+            - name: GROUP_ID
+              value: carmarketplace-connect
+            # Connect stores its own state (connector configs, positions in the WAL, status) in Kafka topics
+            - name: CONFIG_STORAGE_TOPIC
+              value: connect_configs
+            - name: OFFSET_STORAGE_TOPIC
+              value: connect_offsets
+            - name: STATUS_STORAGE_TOPIC
+              value: connect_statuses
+            - name: CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR
+              value: "1"
+            - name: CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR
+              value: "1"
+            - name: CONNECT_STATUS_STORAGE_REPLICATION_FACTOR
+              value: "1"
+            # Plain JSON messages, without a schema wrapped around every message
+            - name: CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE
+              value: "false"
+            - name: CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE
+              value: "false"
+            # Lets connector configs say ${env:POSTGRES_PASSWORD} instead of the password itself
+            - name: CONNECT_CONFIG_PROVIDERS
+              value: env
+            - name: CONNECT_CONFIG_PROVIDERS_ENV_CLASS
+              value: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+            - name: HEAP_OPTS
+              value: "-Xms256m -Xmx384m"
+          ports:
+            - name: http
+              containerPort: 8083
+          resources:
+            requests:
+              cpu: 250m
+              memory: 384Mi
+            limits:
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /connectors
+              port: http
+            periodSeconds: 5
+---
+# ---------------- Kafka UI ----------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-ui
+  namespace: carmarketplace
+spec:
+  type: LoadBalancer
+  selector:
+    app: kafka-ui
+  ports:
+    - name: http
+      port: 8090 # 8080 is the API
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-ui
+  namespace: carmarketplace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-ui
+  template:
+    metadata:
+      labels:
+        app: kafka-ui
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: kafka-ui
+          image: kafbat/kafka-ui:v1.5.0
+          env:
+            - name: KAFKA_CLUSTERS_0_NAME
+              value: carmarketplace
+            - name: KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS
+              value: kafka:9092
+            - name: KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME
+              value: debezium
+            - name: KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS
+              value: http://connect:8083
+            - name: JAVA_OPTS
+              value: "-Xmx256m"
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              memory: 512Mi
