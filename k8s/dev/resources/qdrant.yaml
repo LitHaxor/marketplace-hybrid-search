@@ -1,0 +1,68 @@
+# Qdrant: vector search (HNSW) for the semantic half of hybrid search.
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant
+  namespace: carmarketplace
+spec:
+  type: LoadBalancer # OrbStack publishes LoadBalancer services on localhost
+  selector:
+    app: qdrant
+  ports:
+    - name: http # REST API and the web dashboard (/dashboard)
+      port: 6333
+      targetPort: http
+    - name: grpc # faster binary API, used by the Java client
+      port: 6334
+      targetPort: grpc
+---
+apiVersion: apps/v1
+kind: StatefulSet # StatefulSet, not Deployment: it keeps its disk across restarts
+metadata:
+  name: qdrant
+  namespace: carmarketplace
+spec:
+  serviceName: qdrant
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qdrant
+  template:
+    metadata:
+      labels:
+        app: qdrant
+      annotations: # Prometheus scrapes Qdrant's own metrics endpoint
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "6333"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: qdrant
+          image: qdrant/qdrant:v1.20.0
+          ports:
+            - name: http
+              containerPort: 6333
+            - name: grpc
+              containerPort: 6334
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 2Gi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          volumeMounts:
+            - name: storage
+              mountPath: /qdrant/storage
+  volumeClaimTemplates:
+    - metadata:
+        name: storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
