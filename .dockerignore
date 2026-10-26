@@ -1,0 +1,9 @@
+# Keep the build context small: Docker uploads everything not listed here.
+datasets/
+**/build/
+**/.gradle/
+**/.kotlin/
+.idea/
+k8s/
+.env
+*.env
