@@ -1,0 +1,65 @@
+# Kibana: Elastic's own UI for Elasticsearch.  http://localhost:5601
+#   Discover                      browse and filter the cars in the "vehicles" index
+#   Dev Tools (Console)           run Elasticsearch queries by hand, e.g. GET vehicles/_search
+#   Stack Management → Index Management   indices, mappings, settings, size
+# Must be the same version as Elasticsearch. Security is off in dev, so there's no login.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kibana
+  namespace: carmarketplace
+spec:
+  type: LoadBalancer
+  selector:
+    app: kibana
+  ports:
+    - name: http
+      port: 5601
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kibana
+  namespace: carmarketplace
+spec:
+  replicas: 1
+  # Recreate: stop the old pod first. A rolling update needs memory for both pods at once,
+  # and this single node doesn't have it (the new pod would stay Pending).
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: kibana
+  template:
+    metadata:
+      labels:
+        app: kibana
+    spec:
+      containers:
+        - name: kibana
+          image: kibana:9.5.5
+          env:
+            - name: ELASTICSEARCH_HOSTS
+              value: http://elasticsearch:9200
+            - name: SERVER_PUBLICBASEURL
+              value: http://localhost:5601
+            # Kibana is Node.js: this caps its JavaScript heap (like -Xmx for a JVM).
+            # 512 MB was too small: "JavaScript heap out of memory" during startup, the Node version of Java's OutOfMemoryError.
+            - name: NODE_OPTIONS
+              value: --max-old-space-size=1024
+          ports:
+            - name: http
+              containerPort: 5601
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1536Mi # 1 GB heap + room for Node's own native memory
+          readinessProbe: # Kibana takes a minute or two to start
+            httpGet:
+              path: /api/status
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
