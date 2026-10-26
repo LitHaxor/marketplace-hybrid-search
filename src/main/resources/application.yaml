@@ -1,0 +1,43 @@
+spring:
+  application:
+    name: kotlin-hybrid-search
+  config:
+    import: optional:file:.env[.properties]
+  datasource:
+    url: ${DB_URL}
+  elasticsearch:
+    uris: ${ELASTICSEARCH_URIS:http://localhost:9200}
+  threads:
+    virtual:
+      enabled: true # every HTTP request runs on a virtual thread instead of a pooled platform thread
+
+qdrant:
+  host: ${QDRANT_HOST:localhost}
+  port: ${QDRANT_PORT:6334} # gRPC
+
+# Query vectors for /search: one short text per call
+embedding:
+  model-dir: ${MODEL_DIR:embedding/build/model} # gradle :embedding:downloadModel
+  threads: 1 # CPU threads per model call
+  max-concurrent-calls: 4 # queries embedded at the same time; more wait in line
+
+# CSV for POST /admin/seed. Local default; Kubernetes sets SEED_FILE=/data/vehicles.csv
+seed:
+  file: datasets/vehicles.csv
+
+# true: sold events take the priority lane. false: "before" mode, sold events wait in the bulk lane.
+events:
+  priority-lane-enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true # latency buckets, so Grafana can show p99
