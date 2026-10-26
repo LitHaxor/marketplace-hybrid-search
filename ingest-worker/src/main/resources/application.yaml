@@ -1,0 +1,35 @@
+spring:
+  application:
+    name: ingest-worker
+  threads:
+    virtual:
+      enabled: true # the Kafka listener threads are virtual threads too
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092} # Mac default; Kubernetes sets kafka:9092
+    consumer:
+      auto-offset-reset: earliest # a brand-new consumer group starts from the oldest event, not only new ones
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    # Group ids, threads and batch sizes are set per lane in LaneListeners.kt
+  elasticsearch:
+    uris: ${ELASTICSEARCH_URIS:http://localhost:9200}
+
+qdrant:
+  host: ${QDRANT_HOST:localhost}
+  port: ${QDRANT_PORT:6334} # gRPC
+
+embedding:
+  model-dir: ${MODEL_DIR:build/model} # model.onnx + vocab.txt (gradle :ingest-worker:downloadModel)
+  max-tokens: 128 # title + start of the description; the rest is cut off
+  threads: 2 # CPU threads per model call
+  max-concurrent-calls: 2 # model calls at the same time (each needs native memory and CPU)
+  batch-size: 16 # texts per model call
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
