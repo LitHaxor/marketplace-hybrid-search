@@ -138,24 +138,6 @@ class SearchService(
         return points.map { p: ScoredPoint -> p.id.uuid }
     }
 
-    // RRF: each list votes 1 / (60 + rank). A car ranked high in both lists beats one ranked high in only one.
-    // Positions, not scores: BM25 scores (0..30) and cosine similarities (0..1) can't be compared directly.
-    private fun reciprocalRankFusion(lexical: List<String>, semantic: List<String>): List<Ranked> {
-        val scores: MutableMap<String, Double> = HashMap()
-        val sources: MutableMap<String, MutableSet<String>> = HashMap()
-        lexical.forEachIndexed { rank: Int, id: String ->
-            scores.merge(id, 1.0 / (RRF_K + rank + 1), Double::plus)
-            sources.getOrPut(id) { mutableSetOf() }.add("bm25")
-        }
-        semantic.forEachIndexed { rank: Int, id: String ->
-            scores.merge(id, 1.0 / (RRF_K + rank + 1), Double::plus)
-            sources.getOrPut(id) { mutableSetOf() }.add("vector")
-        }
-        return scores.entries
-            .sortedByDescending { e: Map.Entry<String, Double> -> e.value }
-            .map { e: Map.Entry<String, Double> -> Ranked(e.key, e.value, sources.getValue(e.key)) }
-    }
-
     // The final page's details, in one request
     private fun hydrate(ids: List<String>): Map<String, Map<String, Any?>> {
         if (ids.isEmpty()) return emptyMap()
@@ -192,5 +174,24 @@ class SearchService(
         private const val COLLECTION: String = "vehicles"
         private const val CANDIDATES: Int = 50 // per list, before fusion
         private const val RRF_K: Double = 60.0 // the usual constant: dampens the difference between rank 1 and 2
+
+        // RRF: each list votes 1 / (60 + rank). A car ranked high in both lists beats one ranked high in only one.
+        // Positions, not scores: BM25 scores (0..30) and cosine similarities (0..1) can't be compared directly.
+        // Pure function, no engines involved: internal so tests can call it directly.
+        internal fun reciprocalRankFusion(lexical: List<String>, semantic: List<String>): List<Ranked> {
+            val scores: MutableMap<String, Double> = HashMap()
+            val sources: MutableMap<String, MutableSet<String>> = HashMap()
+            lexical.forEachIndexed { rank: Int, id: String ->
+                scores.merge(id, 1.0 / (RRF_K + rank + 1), Double::plus)
+                sources.getOrPut(id) { mutableSetOf() }.add("bm25")
+            }
+            semantic.forEachIndexed { rank: Int, id: String ->
+                scores.merge(id, 1.0 / (RRF_K + rank + 1), Double::plus)
+                sources.getOrPut(id) { mutableSetOf() }.add("vector")
+            }
+            return scores.entries
+                .sortedByDescending { e: Map.Entry<String, Double> -> e.value }
+                .map { e: Map.Entry<String, Double> -> Ranked(e.key, e.value, sources.getValue(e.key)) }
+        }
     }
 }
